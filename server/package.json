@@ -12,7 +12,8 @@
     "hono": "^4.12.18",
     "ioredis": "^5.10.1",
     "neo4j-driver": "^6.0.1",
-    "openai": "^6.38.0"
+    "openai": "^6.38.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -9,10 +9,10 @@ const connection = createWorkerConnection();
 
 async function handler(job: Job<IndexChunkJob>) {
   console.log(`[${INDEX_CHUNK_QUEUE}] job ${job.id}`, {
-    sessionId: job.data.sessionId,
-    chunkIndex: job.data.chunkIndex,
+    chunkId: job.data.chunkId,
     entities: job.data.entities.length,
     relations: job.data.relations.length,
+    enrichedText: job.data.enrichedText.slice(0, 100),
   });
   // TODO: embed 3 vectors → Qdrant upsert → Neo4j MERGE entities + append edges (idempotent)
 }
