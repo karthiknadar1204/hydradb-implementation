@@ -11,9 +11,9 @@ async function handler(job: Job<IngestSessionJob>) {
   console.log(`[${INGEST_SESSION_QUEUE}] job ${job.id}`, {
     sessionId: job.data.sessionId,
     userId: job.data.userId,
-    turns: job.data.turns.length,
+    message: job.data.message.slice(0, 80),
   });
-  // TODO: segmentation → build windows → enqueue enrich-chunk jobs (idempotent jobIds)
+  // TODO: build window from prior chunks → enqueue enrich-chunk job
 }
 
 export const ingestSessionWorker = new Worker<IngestSessionJob>(
