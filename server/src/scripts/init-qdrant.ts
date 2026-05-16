@@ -4,8 +4,8 @@ async function main() {
   const { exists } = await qdrant.collectionExists(COLLECTION);
 
   if (exists) {
-    console.log(`Collection "${COLLECTION}" already exists. Skipping.`);
-    return;
+    console.log(`Collection "${COLLECTION}" exists — deleting before recreate.`);
+    await qdrant.deleteCollection(COLLECTION);
   }
 
   await qdrant.createCollection(COLLECTION, {
@@ -14,12 +14,12 @@ async function main() {
       latent: { size: 1536, distance: 'Cosine' },
     },
     sparse_vectors: {
-      sparse: {},
+      sparse: { modifier: 'idf' },
     },
   });
 
   console.log(
-    `Collection "${COLLECTION}" created with named vectors (content, latent @ 1536-dim Cosine) and sparse vector (sparse).`
+    `Collection "${COLLECTION}" created — named vectors (content, latent @ 1536 Cosine) + sparse (IDF modifier).`
   );
 }
 

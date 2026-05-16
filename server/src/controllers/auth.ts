@@ -38,7 +38,7 @@ export async function signup(c: Context) {
     .values({ email, password: hash })
     .returning({ id: users.id, email: users.email });
 
-  const token = await sign({ sub: user.id, email: user.email }, JWT_SECRET);
+  const token = await sign({ sub: user.id, email: user.email }, JWT_SECRET, 'HS256');
 
   return c.json({ user, token }, 201);
 }
@@ -65,7 +65,7 @@ export async function login(c: Context) {
     return c.json({ error: 'Invalid credentials' }, 401);
   }
 
-  const token = await sign({ sub: user.id, email: user.email }, JWT_SECRET);
+  const token = await sign({ sub: user.id, email: user.email }, JWT_SECRET, 'HS256');
 
   return c.json({ user: { id: user.id, email: user.email }, token });
 }

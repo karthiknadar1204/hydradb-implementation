@@ -13,11 +13,13 @@ export async function requireAuth(c: Context, next: Next) {
   const token = auth.slice(7);
 
   try {
-    const payload = await verify(token, JWT_SECRET);
+    const payload = await verify(token, JWT_SECRET, 'HS256');
     c.set('userId', payload.sub as string);
     c.set('email', payload.email as string);
     await next();
-  } catch {
-    return c.json({ error: 'Invalid token' }, 401);
+  } catch (err) {
+    console.error('[requireAuth] verify failed:', err);
+    console.error('[requireAuth] JWT_SECRET length:', JWT_SECRET?.length);
+    return c.json({ error: 'Invalid token', reason: (err as Error)?.message }, 401);
   }
 }
