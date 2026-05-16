@@ -6,9 +6,9 @@ export const ENRICH_CHUNK_QUEUE = 'enrich-chunk';
 export type EnrichChunkJob = {
   sessionId: string;
   userId: string;
-  sessionDate: string;
-  chunkIndex: number;
+  chunkId: string;
   segmentText: string;
+  tCommit: string;
   contextWindow: {
     prev: string[];
     next: string[];

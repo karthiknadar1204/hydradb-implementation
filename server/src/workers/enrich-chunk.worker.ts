@@ -10,7 +10,9 @@ const connection = createWorkerConnection();
 async function handler(job: Job<EnrichChunkJob>) {
   console.log(`[${ENRICH_CHUNK_QUEUE}] job ${job.id}`, {
     sessionId: job.data.sessionId,
-    chunkIndex: job.data.chunkIndex,
+    chunkId: job.data.chunkId,
+    prevLen: job.data.contextWindow.prev.length,
+    segment: job.data.segmentText.slice(0, 80),
   });
   // TODO: LLM enrichment (entity resolution + preference mapping) → enqueue index-chunk
 }

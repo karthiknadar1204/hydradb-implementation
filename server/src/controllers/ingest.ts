@@ -1,7 +1,8 @@
 import type { Context } from 'hono';
+import { randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../config/db';
-import { sessions } from '../config/schema';
+import { sessions, messages } from '../config/schema';
 import {
   ingestSessionQueue,
   INGEST_SESSION_QUEUE,
@@ -31,12 +32,25 @@ export async function ingestSession(c: Context) {
     return c.json({ error: 'Session not found' }, 404);
   }
 
+  const chunkId = randomUUID();
+
+  const [inserted] = await db
+    .insert(messages)
+    .values({
+      id: chunkId,
+      sessionId,
+      userId,
+      content: body.message,
+    })
+    .returning({ createdAt: messages.createdAt });
+
   const job = await ingestSessionQueue.add(INGEST_SESSION_QUEUE, {
     sessionId,
     userId,
+    chunkId,
     message: body.message,
-    tCommit: new Date().toISOString(),
+    tCommit: inserted.createdAt.toISOString(),
   });
 
-  return c.json({ jobId: job.id, sessionId }, 202);
+  return c.json({ jobId: job.id, sessionId, chunkId }, 202);
 }

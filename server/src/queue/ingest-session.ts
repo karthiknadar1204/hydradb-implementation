@@ -6,6 +6,7 @@ export const INGEST_SESSION_QUEUE = 'ingest-session';
 export type IngestSessionJob = {
   sessionId: string;
   userId: string;
+  chunkId: string;
   message: string;
   tCommit: string;
 };

@@ -1,19 +1,60 @@
 import { Worker, type Job } from 'bullmq';
+import { and, desc, eq, ne } from 'drizzle-orm';
 import { createWorkerConnection } from './connection';
 import {
   INGEST_SESSION_QUEUE,
   type IngestSessionJob,
 } from '../queue/ingest-session';
+import {
+  enrichChunkQueue,
+  ENRICH_CHUNK_QUEUE,
+} from '../queue/enrich-chunk';
+import { db } from '../config/db';
+import { messages } from '../config/schema';
 
 const connection = createWorkerConnection();
 
+const H_PREV = 5;
+
+async function fetchPrevWindow(
+  sessionId: string,
+  currentChunkId: string
+): Promise<string[]> {
+  const rows = await db
+    .select({ content: messages.content })
+    .from(messages)
+    .where(
+      and(eq(messages.sessionId, sessionId), ne(messages.id, currentChunkId))
+    )
+    .orderBy(desc(messages.createdAt))
+    .limit(H_PREV);
+
+  return rows.reverse().map((r) => r.content);
+}
+
 async function handler(job: Job<IngestSessionJob>) {
+  const { sessionId, userId, chunkId, message, tCommit } = job.data;
+
   console.log(`[${INGEST_SESSION_QUEUE}] job ${job.id}`, {
-    sessionId: job.data.sessionId,
-    userId: job.data.userId,
-    message: job.data.message.slice(0, 80),
+    sessionId,
+    chunkId,
+    message: message.slice(0, 80),
   });
-  // TODO: build window from prior chunks → enqueue enrich-chunk job
+
+  const prev = await fetchPrevWindow(sessionId, chunkId);
+
+  await enrichChunkQueue.add(
+    ENRICH_CHUNK_QUEUE,
+    {
+      sessionId,
+      userId,
+      chunkId,
+      segmentText: message,
+      tCommit,
+      contextWindow: { prev, next: [] },
+    },
+    { jobId: chunkId }
+  );
 }
 
 export const ingestSessionWorker = new Worker<IngestSessionJob>(
