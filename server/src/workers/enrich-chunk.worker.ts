@@ -26,6 +26,13 @@ CRITICAL — scope of extraction:
 - The window of previous messages is provided SOLELY to resolve pronouns and ambiguous references in the current message. Do NOT re-extract facts from the window — they were already captured when those messages were ingested.
 - Example: if a prior message established "my name is Karthik" and the current message says "i am building X", you do NOT emit a HAS_NAME relation; you only emit the BUILDS relation. The name is used only to resolve "i" → "Karthik".
 
+First-person resolution (MANDATORY):
+- If the current message contains "I", "i", "me", "my", "mine", or "myself", you MUST resolve these to the named person established earlier in the conversation window.
+- NEVER emit "I", "me", "my", etc. as an entity name. NEVER use them as "from" or "to" in a relation.
+- If the window contains "my name is Karthik" anywhere — even 10 messages ago — you must use "Karthik" for every first-person pronoun in the current message.
+- If no name has been established in the window, scan the window for any proper name used to refer to the speaker; use that. If absolutely no name exists anywhere, only then use "User" as a placeholder.
+- This rule applies even when the current message starts with "actually", "btw", "oh", or any other discourse marker.
+
 Naming and structure:
 - Use full canonical names. If a person introduced themselves as "Karthik", use "Karthik" everywhere — never "the user" or pronouns.
 - Relation names are UPPER_SNAKE_CASE: WORKS_AT, LIKES, AVOIDS, PREFERS, RELOCATED_TO, OPTIMIZES_FOR, OWNS, HAS_NAME, BUILDS, USES, etc.
@@ -35,8 +42,10 @@ Entity-relation consistency (strict):
 - Every value that appears as "from" or "to" in a relation MUST also appear as an entity in the entities list, with the EXACT same string. No exceptions.
 - Before finalizing output, double-check this. If you reference "memory systems" in a relation, "memory systems" must be in entities.
 
-Temporal:
-- Resolve relative dates ("yesterday", "last week", "two months ago") against the provided reference date. Output tValid as ISO 8601 (YYYY-MM-DD).
+Temporal — values vs entities:
+- Resolve relative dates ("yesterday", "last week", "two months ago", "March 2024") against the provided reference date. Output as ISO 8601 (YYYY-MM-DD) in tValid.
+- Dates and time periods are TEMPORAL VALUES, not entities. NEVER include strings like "April 2026", "last week", "2024", "next Monday" in the entities list.
+- NEVER use a date/time string as the "from" or "to" of a relation. Temporal info belongs in tValid only.
 - If the current message contains no temporal claim, leave tValid as null.
 
 Sentiment, reasoning, context (cMeta):
@@ -45,7 +54,10 @@ Sentiment, reasoning, context (cMeta):
 - Populate context if relevant situational background is present (e.g., "during the migration", "while at school").
 - Use null only when truly absent. Do not invent.
 
-Final check before output:
+Final check before output (you must verify all of these):
+- Did you resolve every "I"/"me"/"my" in the current message to a named person from the window?
+- Is the entities list free of any pronouns ("I", "me", "my")?
+- Is the entities list free of any temporal values ("April 2026", "last week", "2024", etc.)?
 - Are all relation entities in the entities list?
 - Did you accidentally re-extract anything from the window?
 - Did you populate sentiment where implied?`;
