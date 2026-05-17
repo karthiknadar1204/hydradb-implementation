@@ -10,7 +10,27 @@ const N_EXPANSIONS = 3;
 const PREFETCH_LIMIT = 30;
 const FINAL_TOP_K = 10;
 const GRAPH_PATH_LIMIT = 50;
+const EXPANSION_PER_CHUNK_LIMIT = 10;
+// Paper's variable-length traversal: P_graph = Path(E_start →*1..n E_end)
+const GRAPH_MAX_DEPTH = 2;
 const EMBEDDING_MODEL = 'text-embedding-3-small';
+
+// Paper's Stage 2A weighted formula:
+// S_retrieval(q, c) = x · sim(content) + y · sim(latent) + α · BM25(sparse)
+// Scores are min-max normalised per-stream before weighting so the weights are meaningful.
+const WEIGHT_CONTENT = 0.4; // x
+const WEIGHT_LATENT = 0.4; // y
+const WEIGHT_SPARSE = 0.2; // α
+
+// Paper's Stage 4 triple-tier rerank:
+// S_rerank^vs(c) = γ · S_semantic(c) + (1-γ) · S_lexical(c)
+// S_final^vs(c) = β · S_vs(c) + (1-β) · S_rerank^vs(c)
+const GAMMA = 0.7; // semantic vs lexical weight in S_rerank^vs
+const BETA = 0.3; // vector-confidence vs rerank weight in S_final^vs
+
+// Paper's Stage 5 fusion: TopK_1(vector ⊕ expansion) ∪ TopK_2(graph)
+const K1 = 6; // vector + expansion stream
+const K2 = 6; // entity-based graph stream
 
 const expansionSchema = z.object({
   expansions: z.array(z.string()).min(N_EXPANSIONS).max(N_EXPANSIONS),
@@ -18,6 +38,11 @@ const expansionSchema = z.object({
 
 const queryEntitiesSchema = z.object({
   entities: z.array(z.string()).max(5),
+});
+
+const answerSchema = z.object({
+  reasoning: z.string(),
+  answer: z.string(),
 });
 
 const EXPANSION_PROMPT = `You are an expert at rewriting user queries to maximize retrieval recall from a memory system.
@@ -39,13 +64,40 @@ Rules:
 - If the query refers to a person by pronoun only (no name), return an empty array.
 - Maximum 5 entities.`;
 
+const ANSWER_SYSTEM_PROMPT = `You are a personal memory assistant. You answer the user's question using ONLY the provided memory context.
+
+The context contains two streams:
+
+1. **Memories** — relevant chunks from the user's conversation history. Each memory has:
+   - Original: what the user originally said.
+   - Resolved: the same statement rewritten with pronouns and references made explicit.
+   - Ingested: the timestamp when the system learned this fact.
+   - Related facts: structured relationships from the knowledge graph adjacent to this memory.
+
+2. **Structured facts** — relationships from the user's knowledge graph, often with sentiment, t_valid (real-world time the fact is true), t_commit (when ingested), and reasoning.
+
+Rules:
+- Answer based ONLY on the provided context. If the context doesn't contain enough information, say "I don't know" or "I don't have enough information."
+- Be direct and factual. No fluff.
+- Do not invent facts. Do not assume things not stated.
+- When facts evolve over time (e.g., user said one thing, then changed it), prefer the most recent based on t_commit. Note the change if relevant ("you used to X, now Y").
+- For temporal queries, use t_valid for "when in real world" questions and t_commit for "when did you tell me" questions.
+- Cite the underlying memory or fact when it directly supports your answer.
+
+Output JSON with:
+- reasoning: step-by-step thinking about the question and which parts of the context apply.
+- answer: the final direct answer to the user's question.`;
+
 type Candidate = {
   chunkId: string;
-  score: number;
+  score: number; // S_vs initially, S_final^vs after Stage 4
   rawText: string;
   enrichedText: string;
   entityRefs: string[];
   tCommit: string;
+  expansion: GraphPath[];
+  sparseScore: number; // S_lexical(c) — preserved from Stage 2A for Stage 4
+  semanticScore?: number; // S_semantic(c) — cross-encoder score from Stage 4
 };
 
 type GraphPath = {
@@ -58,6 +110,8 @@ type GraphPath = {
   reasoning: string | null;
   context: string | null;
   contextString: string;
+  hops: number;
+  score: number; // S_graph(p) or S_expansion(p) after rerank
 };
 
 async function expandQuery(originalQuery: string): Promise<string[]> {
@@ -90,6 +144,45 @@ async function extractQueryEntities(originalQuery: string): Promise<string[]> {
   return parsed.entities;
 }
 
+type RawHit = {
+  chunkId: string;
+  score: number;
+  payload: Record<string, unknown>;
+};
+
+async function searchOneVector(
+  vector: number[] | { indices: number[]; values: number[] },
+  using: 'content' | 'latent' | 'sparse',
+  filter: { must: Array<{ key: string; match: { value: string } }> }
+): Promise<RawHit[]> {
+  const result = await qdrant.query(COLLECTION, {
+    query: vector,
+    using,
+    limit: PREFETCH_LIMIT,
+    filter,
+    with_payload: true,
+  });
+
+  return (result.points ?? []).map((p) => ({
+    chunkId: p.id as string,
+    score: p.score ?? 0,
+    payload: (p.payload ?? {}) as Record<string, unknown>,
+  }));
+}
+
+function normalizeScores(hits: RawHit[]): Map<string, number> {
+  if (hits.length === 0) return new Map();
+  const scores = hits.map((h) => h.score);
+  const min = Math.min(...scores);
+  const max = Math.max(...scores);
+  const range = max - min;
+  const out = new Map<string, number>();
+  for (const h of hits) {
+    out.set(h.chunkId, range === 0 ? 1 : (h.score - min) / range);
+  }
+  return out;
+}
+
 async function hybridVectorSearch(
   queries: string[],
   userId: string
@@ -109,38 +202,43 @@ async function hybridVectorSearch(
     const denseVec = embedRes.data[i].embedding;
     const sparseVec = toSparseVector(queries[i]);
 
-    let result;
-    try {
-      result = await qdrant.query(COLLECTION, {
-        prefetch: [
-          { query: denseVec, using: 'content', limit: PREFETCH_LIMIT, filter },
-          { query: denseVec, using: 'latent', limit: PREFETCH_LIMIT, filter },
-          { query: sparseVec, using: 'sparse', limit: PREFETCH_LIMIT, filter },
-        ],
-        query: { fusion: 'rrf' },
-        limit: FINAL_TOP_K,
-        with_payload: true,
-      });
-    } catch (err: unknown) {
-      const e = err as { data?: unknown };
-      console.error(`[hybrid] q${i} failed:`, JSON.stringify(e.data, null, 2));
-      throw err;
+    // Three parallel sub-searches against the three named vectors, each returning raw scores
+    const [contentHits, latentHits, sparseHits] = await Promise.all([
+      searchOneVector(denseVec, 'content', filter),
+      searchOneVector(denseVec, 'latent', filter),
+      searchOneVector(sparseVec, 'sparse', filter),
+    ]);
+
+    // Min-max normalise each stream so weights are meaningful across heterogeneous score ranges
+    const contentNorm = normalizeScores(contentHits);
+    const latentNorm = normalizeScores(latentHits);
+    const sparseNorm = normalizeScores(sparseHits);
+
+    // Union of chunkIds touched by any of the three streams + carry forward each chunk's payload
+    const payloads = new Map<string, Record<string, unknown>>();
+    for (const h of [...contentHits, ...latentHits, ...sparseHits]) {
+      if (!payloads.has(h.chunkId)) payloads.set(h.chunkId, h.payload);
     }
 
-    for (const point of result.points ?? []) {
-      const id = point.id as string;
-      const score = point.score ?? 0;
-      const payload = (point.payload ?? {}) as Record<string, unknown>;
+    // Apply the paper's weighted formula. Missing-from-stream defaults to 0 (chunk wasn't relevant there).
+    for (const [chunkId, payload] of Array.from(payloads.entries())) {
+      const cs = contentNorm.get(chunkId) ?? 0;
+      const ls = latentNorm.get(chunkId) ?? 0;
+      const ss = sparseNorm.get(chunkId) ?? 0;
+      const score =
+        WEIGHT_CONTENT * cs + WEIGHT_LATENT * ls + WEIGHT_SPARSE * ss;
 
-      const existing = merged.get(id);
+      const existing = merged.get(chunkId);
       if (!existing || existing.score < score) {
-        merged.set(id, {
-          chunkId: id,
+        merged.set(chunkId, {
+          chunkId,
           score,
           rawText: (payload.rawText as string) ?? '',
           enrichedText: (payload.enrichedText as string) ?? '',
           entityRefs: (payload.entityRefs as string[]) ?? [],
           tCommit: (payload.tCommit as string) ?? '',
+          expansion: [],
+          sparseScore: ss, // preserve S_lexical for Stage 4
         });
       }
     }
@@ -151,6 +249,80 @@ async function hybridVectorSearch(
     .slice(0, FINAL_TOP_K);
 }
 
+type Neo4jNode = { identity: number; properties: Record<string, unknown> };
+type Neo4jRel = {
+  identity: number;
+  start: number;
+  end: number;
+  type: string;
+  properties: Record<string, unknown>;
+};
+type Neo4jSegment = { start: Neo4jNode; end: Neo4jNode; relationship: Neo4jRel };
+type Neo4jPath = { segments: Neo4jSegment[] };
+
+function formatHop(
+  fromName: string,
+  toName: string,
+  props: Record<string, unknown>
+): string {
+  const meta: string[] = [];
+  if (props.sentiment) meta.push(`sentiment=${props.sentiment}`);
+  if (props.t_valid) meta.push(`t_valid=${props.t_valid}`);
+  meta.push(`t_commit=${props.t_commit}`);
+  if (props.reasoning) meta.push(`reasoning="${props.reasoning}"`);
+  if (props.context) meta.push(`context="${props.context}"`);
+  return `${fromName} ${props.type} ${toName} (${meta.join(', ')})`;
+}
+
+function pathToGraphPath(path: Neo4jPath): GraphPath | null {
+  const segments = path.segments;
+  if (!segments || segments.length === 0) return null;
+
+  const hopStrings: string[] = [];
+  const tCommits: string[] = [];
+
+  let firstFromName = '';
+  let lastToName = '';
+  let firstProps: Record<string, unknown> = {};
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    // Resolve stored direction (segment.start/end is traversal order, may be reversed)
+    const traversedForward = seg.start.identity === seg.relationship.start;
+    const fromNode = traversedForward ? seg.start : seg.end;
+    const toNode = traversedForward ? seg.end : seg.start;
+    const fromName = fromNode.properties.name as string;
+    const toName = toNode.properties.name as string;
+
+    hopStrings.push(formatHop(fromName, toName, seg.relationship.properties));
+    tCommits.push(seg.relationship.properties.t_commit as string);
+
+    if (i === 0) {
+      firstFromName = fromName;
+      firstProps = seg.relationship.properties;
+    }
+    if (i === segments.length - 1) {
+      lastToName = toName;
+    }
+  }
+
+  const newestTCommit = tCommits.sort().reverse()[0];
+
+  return {
+    fromName: firstFromName,
+    relation: firstProps.type as string,
+    toName: lastToName,
+    sentiment: (firstProps.sentiment as string | null) ?? null,
+    tValid: (firstProps.t_valid as string | null) ?? null,
+    tCommit: newestTCommit,
+    reasoning: (firstProps.reasoning as string | null) ?? null,
+    context: (firstProps.context as string | null) ?? null,
+    contextString: hopStrings.join(' → '),
+    hops: segments.length,
+    score: 0,
+  };
+}
+
 async function graphSearch(
   entities: string[],
   userId: string
@@ -158,73 +330,198 @@ async function graphSearch(
   if (entities.length === 0) return [];
 
   const session = driver.session();
+  const paths: GraphPath[] = [];
   try {
     const result = await session.executeRead((tx) =>
       tx.run(
         `UNWIND $names AS name
-         MATCH (start:Entity {userId: $userId, name: name})-[r:RELATION]-(other:Entity {userId: $userId})
-         RETURN
-           startNode(r).name AS fromName,
-           r.type         AS relType,
-           endNode(r).name   AS toName,
-           r.sentiment    AS sentiment,
-           r.t_valid      AS tValid,
-           r.t_commit     AS tCommit,
-           r.reasoning    AS reasoning,
-           r.context      AS context,
-           r.edge_id      AS edgeId
-         ORDER BY r.t_commit DESC
-         LIMIT 50`,
+         MATCH p = (start:Entity {userId: $userId, name: name})-[:RELATION*1..${GRAPH_MAX_DEPTH}]-(other:Entity)
+         WHERE all(n IN nodes(p) WHERE n.userId = $userId)
+         RETURN p AS path
+         LIMIT 200`,
         { names: entities, userId }
       )
     );
 
-    // Dedup by edge_id (same edge can appear twice if query mentions both endpoints)
     const seen = new Set<string>();
-    const paths: GraphPath[] = [];
 
     for (const rec of result.records) {
-      const edgeId = rec.get('edgeId') as string;
-      if (seen.has(edgeId)) continue;
-      seen.add(edgeId);
+      const rawPath = rec.get('path') as Neo4jPath;
+      const segments = rawPath.segments ?? [];
+      if (segments.length === 0) continue;
 
-      const fromName = rec.get('fromName') as string;
-      const relation = rec.get('relType') as string;
-      const toName = rec.get('toName') as string;
-      const sentiment = rec.get('sentiment') as string | null;
-      const tValid = rec.get('tValid') as string | null;
-      const tCommit = rec.get('tCommit') as string;
-      const reasoning = rec.get('reasoning') as string | null;
-      const context = rec.get('context') as string | null;
+      const edgeIds = segments.map(
+        (s) => s.relationship.properties.edge_id as string
+      );
+      const pathKey = edgeIds.join('|');
+      if (seen.has(pathKey)) continue;
+      seen.add(pathKey);
 
-      const meta: string[] = [];
-      if (sentiment) meta.push(`sentiment=${sentiment}`);
-      if (tValid) meta.push(`t_valid=${tValid}`);
-      meta.push(`t_commit=${tCommit}`);
-      if (reasoning) meta.push(`reasoning="${reasoning}"`);
-      if (context) meta.push(`context="${context}"`);
-
-      const contextString = `${fromName} ${relation} ${toName} (${meta.join(', ')})`;
-
-      paths.push({
-        fromName,
-        relation,
-        toName,
-        sentiment,
-        tValid,
-        tCommit,
-        reasoning,
-        context,
-        contextString,
-      });
-
-      if (paths.length >= GRAPH_PATH_LIMIT) break;
+      const gp = pathToGraphPath(rawPath);
+      if (gp) paths.push(gp);
     }
-
-    return paths;
   } finally {
     await session.close();
   }
+
+  // Sort by newest first (no reranker → temporal recency is the only signal)
+  paths.sort((a, b) => b.tCommit.localeCompare(a.tCommit));
+  return paths.slice(0, GRAPH_PATH_LIMIT);
+}
+
+async function chunkLevelExpansion(
+  candidates: Candidate[],
+  userId: string
+): Promise<Candidate[]> {
+  if (candidates.length === 0) return candidates;
+
+  // Collect unique entity names across all candidates' pre-linked refs
+  const allEntities = new Set<string>();
+  for (const c of candidates) {
+    for (const e of c.entityRefs) allEntities.add(e);
+  }
+  if (allEntities.size === 0) return candidates;
+
+  // Paper Section 2.6.4: N(c) = union over e in E(c) of Path(e →*1..n)
+  // Variable-length traversal, user-scoped on every node
+  const session = driver.session();
+  let records;
+  try {
+    const result = await session.executeRead((tx) =>
+      tx.run(
+        `UNWIND $names AS name
+         MATCH p = (start:Entity {userId: $userId, name: name})-[:RELATION*1..${GRAPH_MAX_DEPTH}]-(other:Entity)
+         WHERE all(n IN nodes(p) WHERE n.userId = $userId)
+         RETURN name AS startName, p AS path
+         LIMIT 500`,
+        { names: Array.from(allEntities), userId }
+      )
+    );
+    records = result.records;
+  } finally {
+    await session.close();
+  }
+
+  // Group paths by source entity name, deduping by path identity per entity
+  const entityToPaths = new Map<string, GraphPath[]>();
+  const seenPerEntity = new Map<string, Set<string>>();
+
+  for (const rec of records) {
+    const startName = rec.get('startName') as string;
+    const rawPath = rec.get('path') as Neo4jPath;
+    const segments = rawPath.segments ?? [];
+    if (segments.length === 0) continue;
+
+    const edgeIds = segments.map(
+      (s) => s.relationship.properties.edge_id as string
+    );
+    const pathKey = edgeIds.join('|');
+
+    if (!seenPerEntity.has(startName)) seenPerEntity.set(startName, new Set());
+    if (seenPerEntity.get(startName)!.has(pathKey)) continue;
+    seenPerEntity.get(startName)!.add(pathKey);
+
+    const gp = pathToGraphPath(rawPath);
+    if (!gp) continue;
+
+    if (!entityToPaths.has(startName)) entityToPaths.set(startName, []);
+    entityToPaths.get(startName)!.push(gp);
+  }
+
+  // Attach paths to each candidate, dedup across this candidate's entityRefs
+  return candidates.map((cand) => {
+    const seenEdgeChains = new Set<string>();
+    const expansion: GraphPath[] = [];
+
+    for (const entity of cand.entityRefs) {
+      const paths = entityToPaths.get(entity) ?? [];
+      for (const p of paths) {
+        if (seenEdgeChains.has(p.contextString)) continue;
+        seenEdgeChains.add(p.contextString);
+        expansion.push(p);
+        if (expansion.length >= EXPANSION_PER_CHUNK_LIMIT) break;
+      }
+      if (expansion.length >= EXPANSION_PER_CHUNK_LIMIT) break;
+    }
+
+    // Sort by newest first (no reranker)
+    expansion.sort((a, b) => b.tCommit.localeCompare(a.tCommit));
+
+    return { ...cand, expansion };
+  });
+}
+
+// Paper's Stage 6 — Context Assembly + Final Generation
+function formatContextForLLM(
+  candidates: Candidate[],
+  graphPaths: GraphPath[]
+): string {
+  const sections: string[] = [];
+
+  if (candidates.length > 0) {
+    sections.push('## Memories');
+    candidates.forEach((c, i) => {
+      sections.push(`### Memory ${i + 1}`);
+      sections.push(`- Original: ${c.rawText}`);
+      sections.push(`- Resolved: ${c.enrichedText}`);
+      sections.push(`- Ingested: ${c.tCommit}`);
+      if (c.expansion.length > 0) {
+        sections.push(`- Related facts:`);
+        for (const p of c.expansion) {
+          sections.push(`    • ${p.contextString}`);
+        }
+      }
+      sections.push('');
+    });
+  }
+
+  if (graphPaths.length > 0) {
+    sections.push('## Structured facts (knowledge graph)');
+    graphPaths.forEach((p, i) => {
+      sections.push(`${i + 1}. ${p.contextString}`);
+    });
+  }
+
+  return sections.join('\n');
+}
+
+async function generateAnswer(
+  query: string,
+  context: string,
+  questionDate: string
+): Promise<{ reasoning: string; answer: string }> {
+  const userPrompt = `Question: ${query}
+Question Date: ${questionDate}
+
+Context:
+${context}`;
+
+  const result = await openai.chat.completions.parse({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: ANSWER_SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt },
+    ],
+    response_format: zodResponseFormat(answerSchema, 'memory_answer'),
+  });
+
+  const parsed = result.choices[0]?.message.parsed;
+  if (!parsed) throw new Error('Failed to parse answer');
+  return parsed;
+}
+
+// Paper's Stage 5 — Fusion
+// C_final = TopK_1(C_vs^final ⊕ C_expansion, k_1) ∪ TopK_2(C_graph, k_2)
+function fusion(
+  vectorCandidates: Candidate[],
+  graphPaths: GraphPath[]
+): { vectorTop: Candidate[]; graphTop: GraphPath[] } {
+  const vectorSorted = [...vectorCandidates].sort((a, b) => b.score - a.score);
+  const graphSorted = [...graphPaths].sort((a, b) => b.score - a.score);
+  return {
+    vectorTop: vectorSorted.slice(0, K1),
+    graphTop: graphSorted.slice(0, K2),
+  };
 }
 
 export async function query(c: Context) {
@@ -251,32 +548,51 @@ export async function query(c: Context) {
   expansions.forEach((e, i) => console.log(`   ${i + 1}. ${e}`));
   console.log(`[query] queryEntities: ${JSON.stringify(queryEntities)}`);
 
-  // R2 — Weighted hybrid vector search
-  // R3 — Graph entity-based search (runs in parallel)
+  // Stage 2A (vector hybrid) + Stage 2B (graph entity-based) in parallel
   const allQueries = [originalQuery, ...expansions];
-  const [candidates, graphPaths] = await Promise.all([
+  const [rawCandidates, graphPaths] = await Promise.all([
     hybridVectorSearch(allQueries, userId),
     graphSearch(queryEntities, userId),
   ]);
 
-  console.log(`[query] vector candidates (${candidates.length}):`);
-  candidates.forEach((cand, i) => {
+  // Stage 3: chunk-level expansion
+  const candidates = await chunkLevelExpansion(rawCandidates, userId);
+
+  // Stage 5: fusion (no reranker → ranking driven by S_vs for vectors, t_commit for graph)
+  const { vectorTop, graphTop } = fusion(candidates, graphPaths);
+
+  console.log(`[query] final vector candidates (${vectorTop.length}):`);
+  vectorTop.forEach((cand, i) => {
     console.log(
-      `   ${i + 1}. score=${cand.score.toFixed(4)} chunkId=${cand.chunkId.slice(0, 8)}`
+      `   ${i + 1}. S_vs=${cand.score.toFixed(4)} chunkId=${cand.chunkId.slice(0, 8)} expansion=${cand.expansion.length}`
     );
-    console.log(`      raw:      ${cand.rawText.slice(0, 80)}`);
+    console.log(`      raw: ${cand.rawText.slice(0, 80)}`);
   });
 
-  console.log(`[query] graph paths (${graphPaths.length}):`);
-  graphPaths.forEach((p, i) => {
-    console.log(`   ${i + 1}. ${p.contextString}`);
+  console.log(`[query] final graph paths (${graphTop.length}):`);
+  graphTop.forEach((p, i) => {
+    console.log(`   ${i + 1}. ${p.contextString.slice(0, 120)}`);
   });
+
+  // Stage 6: assemble context + generate final answer
+  const questionDate = new Date().toISOString().split('T')[0];
+  const contextText = formatContextForLLM(vectorTop, graphTop);
+  const { reasoning, answer } = await generateAnswer(
+    originalQuery,
+    contextText,
+    questionDate
+  );
+
+  console.log(`[query] reasoning: ${reasoning.slice(0, 200)}${reasoning.length > 200 ? '...' : ''}`);
+  console.log(`[query] answer:    ${answer}`);
 
   return c.json({
     originalQuery,
+    answer,
+    reasoning,
     expansions,
     queryEntities,
-    candidates,
-    graphPaths,
+    candidates: vectorTop,
+    graphPaths: graphTop,
   });
 }
