@@ -29,7 +29,8 @@ function edgeId(
 async function writeToNeo4j(
   entities: Entity[],
   relations: Relation[],
-  tCommit: string
+  tCommit: string,
+  userId: string
 ): Promise<{ entityCount: number; edgeCount: number }> {
   // Build complete entity set; backfill any entity referenced only in relations
   const allEntities = new Map<string, string>();
@@ -61,28 +62,32 @@ async function writeToNeo4j(
   const session = driver.session();
   try {
     if (entityList.length > 0) {
-      await session.run(
-        `UNWIND $entities AS entity
-         MERGE (e:Entity {name: entity.name})
-         SET e.type = entity.type`,
-        { entities: entityList }
+      await session.executeWrite((tx) =>
+        tx.run(
+          `UNWIND $entities AS entity
+           MERGE (e:Entity {userId: $userId, name: entity.name})
+           SET e.type = entity.type`,
+          { entities: entityList, userId }
+        )
       );
     }
 
     if (edgeParams.length > 0) {
-      await session.run(
-        `UNWIND $edges AS edge
-         MATCH (a:Entity {name: edge.from})
-         MATCH (b:Entity {name: edge.to})
-         MERGE (a)-[r:RELATION {edge_id: edge.edge_id}]->(b)
-         ON CREATE SET
-           r.type = edge.type,
-           r.t_commit = edge.t_commit,
-           r.t_valid = edge.t_valid,
-           r.sentiment = edge.sentiment,
-           r.reasoning = edge.reasoning,
-           r.context = edge.context`,
-        { edges: edgeParams }
+      await session.executeWrite((tx) =>
+        tx.run(
+          `UNWIND $edges AS edge
+           MATCH (a:Entity {userId: $userId, name: edge.from})
+           MATCH (b:Entity {userId: $userId, name: edge.to})
+           MERGE (a)-[r:RELATION {edge_id: edge.edge_id}]->(b)
+           ON CREATE SET
+             r.type = edge.type,
+             r.t_commit = edge.t_commit,
+             r.t_valid = edge.t_valid,
+             r.sentiment = edge.sentiment,
+             r.reasoning = edge.reasoning,
+             r.context = edge.context`,
+          { edges: edgeParams, userId }
+        )
       );
     }
   } finally {
@@ -155,7 +160,8 @@ async function handler(job: Job<IndexChunkJob>) {
   const { entityCount, edgeCount } = await writeToNeo4j(
     entities,
     relations,
-    tCommit
+    tCommit,
+    userId
   );
 
   console.log(`[${INDEX_CHUNK_QUEUE}] neo4j write done`, {
