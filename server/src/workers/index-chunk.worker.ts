@@ -97,6 +97,25 @@ async function writeToNeo4j(
   return { entityCount: entityList.length, edgeCount: edgeParams.length };
 }
 
+// Phase 4 — safety-critical keywords floor salience at 0.95 to protect
+// against the LLM accidentally underscoring health/identity facts.
+const SAFETY_KEYWORDS = [
+  'allergic',
+  'allergy',
+  'medication',
+  'diagnosis',
+  'diagnosed',
+  'blood type',
+  'emergency',
+  'prescription',
+];
+
+function applySafetyFloor(salience: number, rawText: string, enrichedText: string): number {
+  const text = (rawText + ' ' + enrichedText).toLowerCase();
+  const isSafetyCritical = SAFETY_KEYWORDS.some((kw) => text.includes(kw));
+  return isSafetyCritical ? Math.max(salience, 0.95) : salience;
+}
+
 async function handler(job: Job<IndexChunkJob>) {
   const {
     sessionId,
@@ -107,13 +126,17 @@ async function handler(job: Job<IndexChunkJob>) {
     entities,
     relations,
     tCommit,
+    salience,
   } = job.data;
 
   console.log(`[${INDEX_CHUNK_QUEUE}] job ${job.id}`, {
     chunkId,
     entities: entities.length,
     relations: relations.length,
+    salience,
   });
+
+  const finalSalience = applySafetyFloor(salience, rawText, enrichedText);
 
   // 3.1 + 3.2: dense embeddings (one round-trip for both)
   const embedRes = await openai.embeddings.create({
@@ -144,6 +167,11 @@ async function handler(job: Job<IndexChunkJob>) {
           enrichedText,
           entityRefs: entities.map((e) => e.name),
           tCommit,
+          // Phase 4 — decay engine seed values
+          salience: finalSalience,
+          retentionScore: finalSalience, // R at t=0 = salience
+          tier: 0, // Hot at ingest
+          accessTimestamps: [],
         },
       },
     ],

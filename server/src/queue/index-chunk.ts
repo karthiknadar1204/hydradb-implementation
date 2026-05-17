@@ -25,6 +25,7 @@ export const enrichmentSchema = z.object({
   enrichedText: z.string(),
   entities: z.array(entitySchema),
   relations: z.array(relationSchema),
+  salience: z.number().min(0).max(1),
 });
 
 export type Entity = z.infer<typeof entitySchema>;

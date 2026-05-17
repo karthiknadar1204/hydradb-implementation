@@ -5,6 +5,10 @@ import openai from '../utils/openai';
 import { qdrant, COLLECTION } from '../utils/qdrant';
 import { toSparseVector } from '../utils/sparse';
 import { driver } from '../utils/neo4j';
+import {
+  recordAccessQueue,
+  RECORD_ACCESS_QUEUE,
+} from '../queue/record-access';
 
 const N_EXPANSIONS = 3;
 const PREFETCH_LIMIT = 30;
@@ -84,20 +88,36 @@ Rules:
 - For temporal queries, use t_valid for "when in real world" questions and t_commit for "when did you tell me" questions.
 - Cite the underlying memory or fact when it directly supports your answer.
 
+## Memory freshness — how to interpret Status and Retention
+
+Each memory has metadata signaling how current the fact is:
+- Hot (Retention > 0.7) — recently mentioned or frequently reinforced. Treat as currently true.
+- Warm (0.3–0.7) — established fact, not recently reinforced. Still likely true.
+- Cold (0.1–0.3) — old fact, not actively reinforced for a long time. Acknowledge uncertainty when citing.
+- Stale (≤ 0.1) — very old, possibly superseded. Use only as historical context, never as current truth.
+
+Rules for using freshness:
+1. When two memories contradict, prefer the higher-Retention one as current truth.
+2. When citing a Cold or Stale memory, frame it historically: "You previously mentioned..." or "A while ago you said..." — never "You currently..."
+3. A Stale memory is not necessarily wrong — it was true once. Don't dismiss it; just don't present it as current.
+4. If only Stale memories speak to the question, acknowledge the uncertainty explicitly: "Based on something you said quite a while ago, ..."
+5. When the user asks about the past explicitly ("what did I like before"), Cold and Stale memories become MORE relevant, not less.
+
 Output JSON with:
 - reasoning: step-by-step thinking about the question and which parts of the context apply.
 - answer: the final direct answer to the user's question.`;
 
 type Candidate = {
   chunkId: string;
-  score: number; // S_vs initially, S_final^vs after Stage 4
+  score: number; // S_vs from Stage 2A weighted formula
   rawText: string;
   enrichedText: string;
   entityRefs: string[];
   tCommit: string;
   expansion: GraphPath[];
-  sparseScore: number; // S_lexical(c) — preserved from Stage 2A for Stage 4
-  semanticScore?: number; // S_semantic(c) — cross-encoder score from Stage 4
+  // Phase 4 — decay engine fields surfaced from Qdrant payload
+  retentionScore: number;
+  tier: number;
 };
 
 type GraphPath = {
@@ -238,7 +258,9 @@ async function hybridVectorSearch(
           entityRefs: (payload.entityRefs as string[]) ?? [],
           tCommit: (payload.tCommit as string) ?? '',
           expansion: [],
-          sparseScore: ss, // preserve S_lexical for Stage 4
+          // Phase 4 — fall back to Hot/full-retention for pre-Phase-4 chunks
+          retentionScore: (payload.retentionScore as number) ?? 1,
+          tier: (payload.tier as number) ?? 0,
         });
       }
     }
@@ -451,6 +473,10 @@ async function chunkLevelExpansion(
   });
 }
 
+function tierName(tier: number): string {
+  return ['Hot', 'Warm', 'Cold', 'Stale'][tier] ?? 'Hot';
+}
+
 // Paper's Stage 6 — Context Assembly + Final Generation
 function formatContextForLLM(
   candidates: Candidate[],
@@ -465,6 +491,8 @@ function formatContextForLLM(
       sections.push(`- Original: ${c.rawText}`);
       sections.push(`- Resolved: ${c.enrichedText}`);
       sections.push(`- Ingested: ${c.tCommit}`);
+      sections.push(`- Status: ${tierName(c.tier)}`);
+      sections.push(`- Retention: ${c.retentionScore.toFixed(2)}`);
       if (c.expansion.length > 0) {
         sections.push(`- Related facts:`);
         for (const p of c.expansion) {
@@ -585,6 +613,19 @@ export async function query(c: Context) {
 
   console.log(`[query] reasoning: ${reasoning.slice(0, 200)}${reasoning.length > 200 ? '...' : ''}`);
   console.log(`[query] answer:    ${answer}`);
+
+  // Phase 4 — fire-and-forget access logging for every surfaced chunk
+  const surfacedChunkIds = vectorTop.map((c) => c.chunkId);
+  if (surfacedChunkIds.length > 0) {
+    recordAccessQueue
+      .add(RECORD_ACCESS_QUEUE, {
+        chunkIds: surfacedChunkIds,
+        accessTime: new Date().toISOString(),
+      })
+      .catch((err) =>
+        console.error('[query] failed to enqueue access record:', err)
+      );
+  }
 
   return c.json({
     originalQuery,

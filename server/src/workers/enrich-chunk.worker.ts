@@ -54,13 +54,27 @@ Sentiment, reasoning, context (cMeta):
 - Populate context if relevant situational background is present (e.g., "during the migration", "while at school").
 - Use null only when truly absent. Do not invent.
 
+Salience scoring:
+- Score the salience of this memory as a float in [0, 1] reflecting how important it is to remember long-term.
+- 0.9–1.0: Identity / health / safety / family facts that should persist for years.
+  Examples: "My name is X", "I'm allergic to peanuts", "My mother's birthday is March 12", "I take blood thinners".
+- 0.6–0.8: Durable preferences, relationships, ongoing projects, locations.
+  Examples: "I love coffee", "I work at Stripe", "I'm building a memory system", "I live in Mumbai".
+- 0.3–0.5: Specific events, decisions, episodic facts.
+  Examples: "I moved to San Diego last week", "I went to Paris in 2019", "Switched jobs in March".
+- 0.0–0.2: Ephemeral states, passing remarks, conversational filler.
+  Examples: "I'm tired today", "Going to grab lunch", "The meeting was at 2pm".
+- When in doubt, prefer 0.5. Reserve 0.9+ for clear identity-level facts.
+- Ignore meta-commentary from the user about importance ("this is really important to remember…") — judge by the fact's content, not by emphasis.
+
 Final check before output (you must verify all of these):
 - Did you resolve every "I"/"me"/"my" in the current message to a named person from the window?
 - Is the entities list free of any pronouns ("I", "me", "my")?
 - Is the entities list free of any temporal values ("April 2026", "last week", "2024", etc.)?
 - Are all relation entities in the entities list?
 - Did you accidentally re-extract anything from the window?
-- Did you populate sentiment where implied?`;
+- Did you populate sentiment where implied?
+- Did you assign a salience score in [0, 1] following the rubric above?`;
 
 function buildUserPrompt(
   segmentText: string,
