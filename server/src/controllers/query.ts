@@ -47,6 +47,7 @@ const queryEntitiesSchema = z.object({
 const answerSchema = z.object({
   reasoning: z.string(),
   answer: z.string(),
+  citedMemoryNumbers: z.array(z.number().int().min(1)),
 });
 
 const EXPANSION_PROMPT = `You are an expert at rewriting user queries to maximize retrieval recall from a memory system.
@@ -84,28 +85,45 @@ Rules:
 - Answer based ONLY on the provided context. If the context doesn't contain enough information, say "I don't know" or "I don't have enough information."
 - Be direct and factual. No fluff.
 - Do not invent facts. Do not assume things not stated.
-- When facts evolve over time (e.g., user said one thing, then changed it), prefer the most recent based on t_commit. Note the change if relevant ("you used to X, now Y").
 - For temporal queries, use t_valid for "when in real world" questions and t_commit for "when did you tell me" questions.
 - Cite the underlying memory or fact when it directly supports your answer.
 
-## Memory freshness — how to interpret Status and Retention
+## Memory freshness — Status and Retention metadata (informational only)
 
-Each memory has metadata signaling how current the fact is:
-- Hot (Retention > 0.7) — recently mentioned or frequently reinforced. Treat as currently true.
-- Warm (0.3–0.7) — established fact, not recently reinforced. Still likely true.
-- Cold (0.1–0.3) — old fact, not actively reinforced for a long time. Acknowledge uncertainty when citing.
-- Stale (≤ 0.1) — very old, possibly superseded. Use only as historical context, never as current truth.
+Each memory has metadata signaling how vivid it is in the system:
+- Hot (Retention > 0.7) — recently mentioned or frequently reinforced.
+- Warm (0.3–0.7) — established, not recently reinforced.
+- Cold (0.1–0.3) — old, not actively reinforced for a long time.
+- Stale (≤ 0.1) — very old.
 
-Rules for using freshness:
-1. When two memories contradict, prefer the higher-Retention one as current truth.
-2. When citing a Cold or Stale memory, frame it historically: "You previously mentioned..." or "A while ago you said..." — never "You currently..."
-3. A Stale memory is not necessarily wrong — it was true once. Don't dismiss it; just don't present it as current.
-4. If only Stale memories speak to the question, acknowledge the uncertainty explicitly: "Based on something you said quite a while ago, ..."
-5. When the user asks about the past explicitly ("what did I like before"), Cold and Stale memories become MORE relevant, not less.
+IMPORTANT: Retention encodes how often a memory has been mentioned or retrieved — it is NOT a signal of truth. A Hot memory can be stale truth; a Warm memory can be current truth. Never use Retention to resolve a contradiction; use the precedence ladder below.
+
+## Resolving conflicting facts — precedence order
+
+When two memories contradict, resolve in this exact order. Higher rules beat lower ones absolutely.
+
+1. **Explicit supersession wins.** If one memory describes a transition that obsoletes another — verbs like "moved", "switched", "changed", "left", "stopped", "no longer", "now instead", "used to" — the transition memory is the current truth. The superseded memory becomes historical. Retention is irrelevant here.
+
+2. **Real-world time (t_valid) wins next.** Among graph facts with a t_valid field, the one whose t_valid is most recent (and ≤ today) is the current state.
+
+3. **Ingestion time (t_commit) wins next.** When t_valid is missing or identical, the most recently ingested memory is the current state.
+
+4. **Retention is a tie-breaker only.** Use Status/Retention to choose between memories that are temporally equivalent under rules 1–3.
+
+## How to phrase
+
+- Memories that lost the contradiction become historical — frame with "previously", "used to", "before X". Never present as current.
+- A Stale memory is not necessarily wrong; just don't present it as current. Acknowledge uncertainty: "Based on something you told me a while ago…"
+- If the user explicitly asks about the past, historical memories become MORE relevant, not less.
+
+## Citations (REQUIRED)
+
+After answering, populate \`citedMemoryNumbers\` with the 1-based numbers of the memories that DIRECTLY informed your answer (e.g., if Memory 1 and Memory 3 supported your conclusion, return [1, 3]). Do NOT include memories you read but chose not to use. Be honest — citing more memories does NOT improve your answer. Citing incorrectly skews the system's long-term retention model and degrades future answers. If you answered "I don't know", return an empty array.
 
 Output JSON with:
 - reasoning: step-by-step thinking about the question and which parts of the context apply.
-- answer: the final direct answer to the user's question.`;
+- answer: the final direct answer to the user's question.
+- citedMemoryNumbers: 1-based integer array of memories that directly informed the answer.`;
 
 type Candidate = {
   chunkId: string;
@@ -517,7 +535,7 @@ async function generateAnswer(
   query: string,
   context: string,
   questionDate: string
-): Promise<{ reasoning: string; answer: string }> {
+): Promise<{ reasoning: string; answer: string; citedMemoryNumbers: number[] }> {
   const userPrompt = `Question: ${query}
 Question Date: ${questionDate}
 
@@ -605,7 +623,7 @@ export async function query(c: Context) {
   // Stage 6: assemble context + generate final answer
   const questionDate = new Date().toISOString().split('T')[0];
   const contextText = formatContextForLLM(vectorTop, graphTop);
-  const { reasoning, answer } = await generateAnswer(
+  const { reasoning, answer, citedMemoryNumbers } = await generateAnswer(
     originalQuery,
     contextText,
     questionDate
@@ -613,13 +631,21 @@ export async function query(c: Context) {
 
   console.log(`[query] reasoning: ${reasoning.slice(0, 200)}${reasoning.length > 200 ? '...' : ''}`);
   console.log(`[query] answer:    ${answer}`);
+  console.log(`[query] cited memories: ${JSON.stringify(citedMemoryNumbers)}`);
 
-  // Phase 4 — fire-and-forget access logging for every surfaced chunk
-  const surfacedChunkIds = vectorTop.map((c) => c.chunkId);
-  if (surfacedChunkIds.length > 0) {
+  // Phase 4 — fire-and-forget access logging — ONLY for memories the LLM
+  // actually cited. Surfaced-but-unused memories don't get reinforced.
+  // This defends against reinforcement grooming and makes retention track
+  // "memories that actually answered questions" rather than "memories that
+  // appeared in retrieval".
+  const citedChunkIds = citedMemoryNumbers
+    .map((n) => vectorTop[n - 1]?.chunkId)
+    .filter((id): id is string => typeof id === 'string');
+
+  if (citedChunkIds.length > 0) {
     recordAccessQueue
       .add(RECORD_ACCESS_QUEUE, {
-        chunkIds: surfacedChunkIds,
+        chunkIds: citedChunkIds,
         accessTime: new Date().toISOString(),
       })
       .catch((err) =>
@@ -635,5 +661,6 @@ export async function query(c: Context) {
     queryEntities,
     candidates: vectorTop,
     graphPaths: graphTop,
+    citedMemoryNumbers,
   });
 }
