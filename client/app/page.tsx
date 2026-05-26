@@ -7,6 +7,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { IngestPanel } from "@/components/ingest-panel";
 import { RetrievePanel } from "@/components/retrieve-panel";
 import { GraphView } from "@/components/graph-view";
+import { CreateSessionDialog } from "@/components/create-session-dialog";
 import { apiFetch, type Session } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
@@ -14,7 +15,7 @@ export default function HomePage() {
   const { ready, authed } = useAuth();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -35,20 +36,13 @@ export default function HomePage() {
     refreshSessions();
   }, [authed, refreshSessions]);
 
-  const createSession = async () => {
-    if (creating) return;
-    setCreating(true);
-    try {
-      const title = `Session ${new Date().toLocaleString()}`;
-      const res = await apiFetch<{ session: Session }>(`/sessions`, {
-        method: "POST",
-        body: JSON.stringify({ title }),
-      });
-      setSessions((prev) => [res.session, ...prev]);
-      setActiveId(res.session.id);
-    } finally {
-      setCreating(false);
-    }
+  const createSession = async (title: string) => {
+    const res = await apiFetch<{ session: Session }>(`/sessions`, {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    });
+    setSessions((prev) => [res.session, ...prev]);
+    setActiveId(res.session.id);
   };
 
   if (!ready || !authed) return null;
@@ -60,8 +54,13 @@ export default function HomePage() {
           sessions={sessions}
           activeSessionId={activeId}
           onSelect={setActiveId}
+          onCreate={() => setCreateOpen(true)}
+          creating={false}
+        />
+        <CreateSessionDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
           onCreate={createSession}
-          creating={creating}
         />
         <main className="flex flex-1 flex-col min-w-0 h-svh">
           <header className="flex items-center gap-2 border-b border-border px-3 py-2">
@@ -80,10 +79,10 @@ export default function HomePage() {
           <div className="flex-1 grid grid-rows-[1fr_auto] gap-3 p-3 min-h-0">
             <div className="grid grid-cols-2 gap-3 min-h-0">
               <IngestPanel sessionId={activeId} />
-              <RetrievePanel />
+              <RetrievePanel sessionId={activeId} />
             </div>
             <div className="h-[400px]">
-              <GraphView />
+              <GraphView sessionId={activeId} />
             </div>
           </div>
         </main>

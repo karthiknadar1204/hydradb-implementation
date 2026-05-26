@@ -30,7 +30,8 @@ async function writeToNeo4j(
   entities: Entity[],
   relations: Relation[],
   tCommit: string,
-  userId: string
+  userId: string,
+  sessionId: string
 ): Promise<{ entityCount: number; edgeCount: number }> {
   // Build complete entity set; backfill any entity referenced only in relations
   const allEntities = new Map<string, string>();
@@ -47,6 +48,8 @@ async function writeToNeo4j(
     type,
   }));
 
+  // Entities stay user-scoped (canonical names shared across sessions).
+  // Edges carry sessionId so retrieval can filter the relational state per session.
   const edgeParams = relations.map((r) => ({
     from: r.from,
     to: r.to,
@@ -57,6 +60,7 @@ async function writeToNeo4j(
     sentiment: r.cMeta.sentiment,
     reasoning: r.cMeta.reasoning,
     context: r.cMeta.context,
+    sessionId,
   }));
 
   const session = driver.session();
@@ -85,7 +89,8 @@ async function writeToNeo4j(
              r.t_valid = edge.t_valid,
              r.sentiment = edge.sentiment,
              r.reasoning = edge.reasoning,
-             r.context = edge.context`,
+             r.context = edge.context,
+             r.sessionId = edge.sessionId`,
           { edges: edgeParams, userId }
         )
       );
@@ -189,7 +194,8 @@ async function handler(job: Job<IndexChunkJob>) {
     entities,
     relations,
     tCommit,
-    userId
+    userId,
+    sessionId
   );
 
   console.log(`[${INDEX_CHUNK_QUEUE}] neo4j write done`, {

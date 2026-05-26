@@ -81,7 +81,11 @@ function EntityNode({ data }: NodeProps<Node<EntityNodeData>>) {
 
 const nodeTypes = { entity: EntityNode };
 
-export function GraphView() {
+type Props = {
+  sessionId: string | null;
+};
+
+export function GraphView({ sessionId }: Props) {
   const [snapshot, setSnapshot] = useState<GraphSnapshot | null>(null);
   const [status, setStatus] = useState<"connecting" | "live" | "error">(
     "connecting"
@@ -93,13 +97,17 @@ export function GraphView() {
     let reconnect: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
 
+    // Reset snapshot when the session scope changes so we don't show stale
+    // edges from the previous session while the new stream is connecting.
+    setSnapshot(null);
+
     const connect = () => {
       const token = getToken();
       if (!token) return;
       setStatus("connecting");
-      es = new EventSource(
-        `${API_BASE}/graph/stream?token=${encodeURIComponent(token)}`
-      );
+      const params = new URLSearchParams({ token });
+      if (sessionId) params.set("sessionId", sessionId);
+      es = new EventSource(`${API_BASE}/graph/stream?${params.toString()}`);
 
       es.addEventListener("graph", (ev) => {
         try {
@@ -126,7 +134,7 @@ export function GraphView() {
       if (reconnect) clearTimeout(reconnect);
       es?.close();
     };
-  }, []);
+  }, [sessionId]);
 
   // If the selected node disappears from a new snapshot, clear selection.
   useEffect(() => {
@@ -237,7 +245,9 @@ export function GraphView() {
         <div className="flex flex-col">
           <span className="text-sm font-medium">Knowledge graph</span>
           <span className="text-xs text-muted-foreground">
-            Click a node to inspect its relations
+            {sessionId
+              ? "Scoped to this session — click a node to inspect"
+              : "All sessions — click a node to inspect"}
           </span>
         </div>
         <div className="flex items-center gap-2 text-[11px] font-mono">

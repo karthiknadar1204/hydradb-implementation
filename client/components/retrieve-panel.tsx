@@ -16,7 +16,11 @@ type Turn = {
 
 const TIER_LABELS = ["Hot", "Warm", "Cold", "Stale"];
 
-export function RetrievePanel() {
+type Props = {
+  sessionId: string | null;
+};
+
+export function RetrievePanel({ sessionId }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -41,7 +45,10 @@ export function RetrievePanel() {
     try {
       const res = await apiFetch<QueryResponse>(`/query`, {
         method: "POST",
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({
+          query: q,
+          ...(sessionId ? { sessionId } : {}),
+        }),
       });
       setTurns((prev) =>
         prev.map((t) =>
@@ -74,7 +81,9 @@ export function RetrievePanel() {
         <div className="flex flex-col">
           <span className="text-sm font-medium">Retrieve</span>
           <span className="text-xs text-muted-foreground">
-            Ask Hydra what it remembers
+            {sessionId
+              ? "Asks Hydra what it remembers from this session"
+              : "Pick a session to ask within it"}
           </span>
         </div>
       </div>
@@ -82,7 +91,9 @@ export function RetrievePanel() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4">
         {turns.length === 0 && (
           <p className="text-xs text-muted-foreground">
-            Queries run across all sessions for your account.
+            {sessionId
+              ? "Memories are scoped to this session. The knowledge graph stays user-wide."
+              : "No session selected — queries will hit all your sessions."}
           </p>
         )}
         {turns.map((t) => (

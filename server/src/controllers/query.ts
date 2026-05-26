@@ -88,6 +88,18 @@ Rules:
 - For temporal queries, use t_valid for "when in real world" questions and t_commit for "when did you tell me" questions.
 - Cite the underlying memory or fact when it directly supports your answer.
 
+## Entity grounding (CRITICAL)
+
+If the query mentions a specific named entity (person, place, organization), you must only answer about that entity if a memory or graph fact explicitly mentions it BY NAME. Never substitute facts from a different named entity just because they share an attribute.
+
+Example of what NOT to do: a memory states "Kitkat lives in Delhi" and the query asks "Where does Karthik live?". You must NOT answer "Karthik lives in Delhi" — Karthik and Kitkat are different entities. The correct response is "I don't have any information about Karthik."
+
+When the named entity in the query is missing from all surfaced memories, return:
+- answer: "I don't have any information about <entity>."
+- citedMemoryNumbers: []
+
+Two different named entities are never the same person, organization, or place unless the context explicitly states they are (e.g., a memory saying "Karthik also goes by Kitkat"). Sharing an attribute (same city, same job, same drink preference) is NOT evidence of identity equivalence.
+
 ## Memory freshness — Status and Retention metadata (informational only)
 
 Each memory has metadata signaling how vivid it is in the system:
@@ -223,15 +235,25 @@ function normalizeScores(hits: RawHit[]): Map<string, number> {
 
 async function hybridVectorSearch(
   queries: string[],
-  userId: string
+  userId: string,
+  sessionId?: string
 ): Promise<Candidate[]> {
   const embedRes = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
     input: queries,
   });
 
+  // Session-scoped retrieval: chunks are episodic memory (this conversation,
+  // this moment). When sessionId is provided, narrow to that session only.
+  // The graph stays user-scoped — it represents accumulated semantic knowledge
+  // that's true regardless of which session the user mentioned it in.
   const filter = {
-    must: [{ key: 'userId', match: { value: userId } }],
+    must: [
+      { key: 'userId', match: { value: userId } },
+      ...(sessionId
+        ? [{ key: 'sessionId', match: { value: sessionId } }]
+        : []),
+    ],
   };
 
   const merged = new Map<string, Candidate>();
@@ -365,9 +387,17 @@ function pathToGraphPath(path: Neo4jPath): GraphPath | null {
 
 async function graphSearch(
   entities: string[],
-  userId: string
+  userId: string,
+  sessionId?: string
 ): Promise<GraphPath[]> {
   if (entities.length === 0) return [];
+
+  // When sessionId is set, restrict the traversal to edges committed within
+  // that session. Entities are still user-scoped (canonical names are shared)
+  // — we only filter the relationships they connect through.
+  const sessionFilter = sessionId
+    ? `AND all(r IN relationships(p) WHERE r.sessionId = $sessionId)`
+    : '';
 
   const session = driver.session();
   const paths: GraphPath[] = [];
@@ -377,9 +407,10 @@ async function graphSearch(
         `UNWIND $names AS name
          MATCH p = (start:Entity {userId: $userId, name: name})-[:RELATION*1..${GRAPH_MAX_DEPTH}]-(other:Entity)
          WHERE all(n IN nodes(p) WHERE n.userId = $userId)
+           ${sessionFilter}
          RETURN p AS path
          LIMIT 200`,
-        { names: entities, userId }
+        { names: entities, userId, sessionId }
       )
     );
 
@@ -411,7 +442,8 @@ async function graphSearch(
 
 async function chunkLevelExpansion(
   candidates: Candidate[],
-  userId: string
+  userId: string,
+  sessionId?: string
 ): Promise<Candidate[]> {
   if (candidates.length === 0) return candidates;
 
@@ -423,7 +455,12 @@ async function chunkLevelExpansion(
   if (allEntities.size === 0) return candidates;
 
   // Paper Section 2.6.4: N(c) = union over e in E(c) of Path(e →*1..n)
-  // Variable-length traversal, user-scoped on every node
+  // Variable-length traversal, user-scoped on every node; edges optionally
+  // filtered by sessionId so the expansion stays within the active session.
+  const sessionFilter = sessionId
+    ? `AND all(r IN relationships(p) WHERE r.sessionId = $sessionId)`
+    : '';
+
   const session = driver.session();
   let records;
   try {
@@ -432,9 +469,10 @@ async function chunkLevelExpansion(
         `UNWIND $names AS name
          MATCH p = (start:Entity {userId: $userId, name: name})-[:RELATION*1..${GRAPH_MAX_DEPTH}]-(other:Entity)
          WHERE all(n IN nodes(p) WHERE n.userId = $userId)
+           ${sessionFilter}
          RETURN name AS startName, p AS path
          LIMIT 500`,
-        { names: Array.from(allEntities), userId }
+        { names: Array.from(allEntities), userId, sessionId }
       )
     );
     records = result.records;
@@ -570,6 +608,31 @@ function fusion(
   };
 }
 
+// Entity grounding pre-check. When the query names specific entities and
+// NONE of them appear in any surfaced memory's entityRefs or in any graph
+// path's endpoints, abstain. This prevents the LLM from "smoothing over"
+// the mismatch by equating the queried entity with whatever person-shaped
+// entity is in the context (e.g., asking about Karthik in a Kitkat session
+// and the LLM claiming "Karthik also known as Kitkat").
+function entityMissingFromContext(
+  queryEntities: string[],
+  candidates: Candidate[],
+  graphPaths: GraphPath[]
+): boolean {
+  if (queryEntities.length === 0) return false;
+
+  const surfaced = new Set<string>();
+  for (const c of candidates) {
+    for (const e of c.entityRefs) surfaced.add(e.toLowerCase());
+  }
+  for (const p of graphPaths) {
+    surfaced.add(p.fromName.toLowerCase());
+    surfaced.add(p.toName.toLowerCase());
+  }
+
+  return queryEntities.every((q) => !surfaced.has(q.toLowerCase()));
+}
+
 export async function query(c: Context) {
   const userId = c.get('userId') as string;
 
@@ -580,6 +643,10 @@ export async function query(c: Context) {
   }
 
   const originalQuery = body.query.trim();
+  const sessionId =
+    typeof body.sessionId === 'string' && body.sessionId.length > 0
+      ? body.sessionId
+      : undefined;
 
   // R1 — Adaptive query expansion
   // R3 — Entity extraction (runs in parallel)
@@ -589,20 +656,25 @@ export async function query(c: Context) {
   ]);
 
   console.log(`[query] userId=${userId}`);
+  console.log(`[query] scope: ${sessionId ? `session=${sessionId}` : 'all sessions'}`);
   console.log(`[query] original:     ${originalQuery}`);
   console.log(`[query] expansions:`);
   expansions.forEach((e, i) => console.log(`   ${i + 1}. ${e}`));
   console.log(`[query] queryEntities: ${JSON.stringify(queryEntities)}`);
 
-  // Stage 2A (vector hybrid) + Stage 2B (graph entity-based) in parallel
+  // Stage 2A (vector hybrid) + Stage 2B (graph entity-based) in parallel.
+  // Both are session-scoped when sessionId is provided. Entities stay
+  // user-scoped (canonical names shared across sessions), but the relational
+  // state — the edges — is filtered by sessionId so each session sees only
+  // facts established within it.
   const allQueries = [originalQuery, ...expansions];
   const [rawCandidates, graphPaths] = await Promise.all([
-    hybridVectorSearch(allQueries, userId),
-    graphSearch(queryEntities, userId),
+    hybridVectorSearch(allQueries, userId, sessionId),
+    graphSearch(queryEntities, userId, sessionId),
   ]);
 
   // Stage 3: chunk-level expansion
-  const candidates = await chunkLevelExpansion(rawCandidates, userId);
+  const candidates = await chunkLevelExpansion(rawCandidates, userId, sessionId);
 
   // Stage 5: fusion (no reranker → ranking driven by S_vs for vectors, t_commit for graph)
   const { vectorTop, graphTop } = fusion(candidates, graphPaths);
@@ -623,11 +695,28 @@ export async function query(c: Context) {
   // Stage 6: assemble context + generate final answer
   const questionDate = new Date().toISOString().split('T')[0];
   const contextText = formatContextForLLM(vectorTop, graphTop);
-  const { reasoning, answer, citedMemoryNumbers } = await generateAnswer(
-    originalQuery,
-    contextText,
-    questionDate
-  );
+
+  let reasoning: string;
+  let answer: string;
+  let citedMemoryNumbers: number[];
+
+  // Entity grounding guard. If the query names entities that aren't in the
+  // surfaced context, abstain instead of calling the LLM. Stops the LLM
+  // from inventing identity equivalences.
+  if (entityMissingFromContext(queryEntities, vectorTop, graphTop)) {
+    const missing = queryEntities.join(', ');
+    reasoning = `The query references entities not present in any surfaced memory or graph fact: ${missing}. Abstaining to avoid conflating distinct entities.`;
+    answer = sessionId
+      ? `I don't have any information about ${missing} in this session.`
+      : `I don't have any information about ${missing}.`;
+    citedMemoryNumbers = [];
+    console.log(`[query] entity grounding fired: ${missing} not in surfaced context`);
+  } else {
+    const result = await generateAnswer(originalQuery, contextText, questionDate);
+    reasoning = result.reasoning;
+    answer = result.answer;
+    citedMemoryNumbers = result.citedMemoryNumbers;
+  }
 
   console.log(`[query] reasoning: ${reasoning.slice(0, 200)}${reasoning.length > 200 ? '...' : ''}`);
   console.log(`[query] answer:    ${answer}`);
