@@ -2,6 +2,8 @@
   "name": "server",
   "scripts": {
     "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "start:workers": "bun run src/workers/index.ts",
     "workers": "bun run --hot src/workers/index.ts",
     "worker:ingest-session": "bun run --hot src/workers/ingest-session.worker.ts",
     "worker:enrich-chunk": "bun run --hot src/workers/enrich-chunk.worker.ts",
