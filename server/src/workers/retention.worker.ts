@@ -2,6 +2,7 @@ import { Worker, type Job } from 'bullmq';
 import { createWorkerConnection } from './connection';
 import {
   RETENTION_QUEUE,
+  retentionQueue,
   type RetentionJob,
 } from '../queue/retention';
 import { qdrant, COLLECTION } from '../utils/qdrant';
@@ -130,5 +131,30 @@ const shutdown = async () => {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// Phase 4 — register the nightly recompute as a repeatable job.
+// Idempotent via fixed jobId; safe to call on every startup.
+async function scheduleDailyRecompute() {
+  try {
+    await retentionQueue.add(
+      'daily-retention-recompute',
+      { reason: 'scheduled' },
+      {
+        repeat: { pattern: '0 3 * * *' },
+        jobId: 'retention-daily',
+      }
+    );
+    console.log(
+      `[${RETENTION_QUEUE}] daily recompute scheduled (cron: 0 3 * * *)`
+    );
+  } catch (err) {
+    console.error(
+      `[${RETENTION_QUEUE}] failed to schedule daily job:`,
+      err
+    );
+  }
+}
+
+scheduleDailyRecompute();
 
 console.log(`[${RETENTION_QUEUE}] worker started (concurrency=1)`);

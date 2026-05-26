@@ -1,7 +1,13 @@
 {
   "name": "server",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "workers": "bun run --hot src/workers/index.ts",
+    "worker:ingest-session": "bun run --hot src/workers/ingest-session.worker.ts",
+    "worker:enrich-chunk": "bun run --hot src/workers/enrich-chunk.worker.ts",
+    "worker:index-chunk": "bun run --hot src/workers/index-chunk.worker.ts",
+    "worker:record-access": "bun run --hot src/workers/record-access.worker.ts",
+    "worker:retention": "bun run --hot src/workers/retention.worker.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
